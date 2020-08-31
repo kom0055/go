@@ -126,6 +126,13 @@ func (v *Value) AuxValAndOff() ValAndOff {
 	return ValAndOff(v.AuxInt)
 }
 
+func (v *Value) AuxArm64BitField() arm64BitField {
+	if opcodeTable[v.Op].auxType != auxARM64BitField {
+		v.Fatalf("op %s doesn't have a ValAndOff aux field", v.Op)
+	}
+	return arm64BitField(v.AuxInt)
+}
+
 // long form print.  v# = opcode <type> [aux] args [: reg] (names)
 func (v *Value) LongString() string {
 	s := fmt.Sprintf("v%d = %s", v.ID, v.Op)
@@ -176,8 +183,8 @@ func (v *Value) auxString() string {
 	case auxInt64, auxInt128:
 		return fmt.Sprintf(" [%d]", v.AuxInt)
 	case auxARM64BitField:
-		lsb := getARM64BFlsb(v.AuxInt)
-		width := getARM64BFwidth(v.AuxInt)
+		lsb := v.AuxArm64BitField().getARM64BFlsb()
+		width := v.AuxArm64BitField().getARM64BFwidth()
 		return fmt.Sprintf(" [lsb=%d,width=%d]", lsb, width)
 	case auxFloat32, auxFloat64:
 		return fmt.Sprintf(" [%g]", v.AuxFloat())
@@ -452,4 +459,24 @@ func (v *Value) LackingPos() bool {
 	// with respect to their source position.
 	return v.Op == OpVarDef || v.Op == OpVarKill || v.Op == OpVarLive || v.Op == OpPhi ||
 		(v.Op == OpFwdRef || v.Op == OpCopy) && v.Type == types.TypeMem
+}
+
+// removeable reports whether the value v can be removed from the SSA graph entirely
+// if its use count drops to 0.
+func (v *Value) removeable() bool {
+	if v.Type.IsVoid() {
+		// Void ops, like nil pointer checks, must stay.
+		return false
+	}
+	if v.Type.IsMemory() {
+		// All memory ops aren't needed here, but we do need
+		// to keep calls at least (because they might have
+		// syncronization operations we can't see).
+		return false
+	}
+	if v.Op.HasSideEffects() {
+		// These are mostly synchronization operations.
+		return false
+	}
+	return true
 }

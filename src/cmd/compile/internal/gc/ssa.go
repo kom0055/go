@@ -295,7 +295,10 @@ func (s *state) emitOpenDeferInfo() {
 // worker indicates which of the backend workers is doing the processing.
 func buildssa(fn *Node, worker int) *ssa.Func {
 	name := fn.funcname()
-	printssa := name == ssaDump
+	printssa := false
+	if ssaDump != "" { // match either a simple name e.g. "(*Reader).Reset", or a package.name e.g. "compress/gzip.(*Reader).Reset"
+		printssa = name == ssaDump || myimportpath+"."+name == ssaDump
+	}
 	var astBuf *bytes.Buffer
 	if printssa {
 		astBuf = &bytes.Buffer{}
@@ -329,8 +332,8 @@ func buildssa(fn *Node, worker int) *ssa.Func {
 	s.f.Config = ssaConfig
 	s.f.Cache = &ssaCaches[worker]
 	s.f.Cache.Reset()
-	s.f.DebugTest = s.f.DebugHashMatch("GOSSAHASH", name)
 	s.f.Name = name
+	s.f.DebugTest = s.f.DebugHashMatch("GOSSAHASH")
 	s.f.PrintOrHtmlSSA = printssa
 	if fn.Func.Pragma&Nosplit != 0 {
 		s.f.NoSplit = true
@@ -338,15 +341,16 @@ func buildssa(fn *Node, worker int) *ssa.Func {
 	s.panics = map[funcLine]*ssa.Block{}
 	s.softFloat = s.config.SoftFloat
 
+	// Allocate starting block
+	s.f.Entry = s.f.NewBlock(ssa.BlockPlain)
+	s.f.Entry.Pos = fn.Pos
+
 	if printssa {
 		s.f.HTMLWriter = ssa.NewHTMLWriter(ssaDumpFile, s.f, ssaDumpCFG)
 		// TODO: generate and print a mapping from nodes to values and blocks
 		dumpSourcesColumn(s.f.HTMLWriter, fn)
 		s.f.HTMLWriter.WriteAST("AST", astBuf)
 	}
-
-	// Allocate starting block
-	s.f.Entry = s.f.NewBlock(ssa.BlockPlain)
 
 	// Allocate starting values
 	s.labels = map[string]*ssaLabel{}
@@ -4206,7 +4210,7 @@ func (s *state) openDeferSave(n *Node, t *types.Type, val *ssa.Value) *ssa.Value
 		s.vars[&memVar] = s.newValue1Apos(ssa.OpVarLive, types.TypeMem, argTemp, s.mem(), false)
 		addrArgTemp = s.newValue2Apos(ssa.OpLocalAddr, types.NewPtr(argTemp.Type), argTemp, s.sp, s.mem(), false)
 	}
-	if types.Haspointers(t) {
+	if t.HasPointers() {
 		// Since we may use this argTemp during exit depending on the
 		// deferBits, we must define it unconditionally on entry.
 		// Therefore, we must make sure it is zeroed out in the entry
@@ -4308,22 +4312,16 @@ func (s *state) openDeferExit() {
 			s.vars[&memVar] = s.newValue1Apos(ssa.OpVarLive, types.TypeMem, r.closureNode, s.mem(), false)
 		}
 		if r.rcvrNode != nil {
-			if types.Haspointers(r.rcvrNode.Type) {
+			if r.rcvrNode.Type.HasPointers() {
 				s.vars[&memVar] = s.newValue1Apos(ssa.OpVarLive, types.TypeMem, r.rcvrNode, s.mem(), false)
 			}
 		}
 		for _, argNode := range r.argNodes {
-			if types.Haspointers(argNode.Type) {
+			if argNode.Type.HasPointers() {
 				s.vars[&memVar] = s.newValue1Apos(ssa.OpVarLive, types.TypeMem, argNode, s.mem(), false)
 			}
 		}
 
-		if i == len(s.openDefers)-1 {
-			// Record the call of the first defer. This will be used
-			// to set liveness info for the deferreturn (which is also
-			// used for any location that causes a runtime panic)
-			s.f.LastDeferExit = call
-		}
 		s.endBlock()
 		s.startBlock(bEnd)
 	}
@@ -4959,7 +4957,7 @@ func (s *state) rtcall(fn *obj.LSym, returns bool, results []*types.Type, args .
 func (s *state) storeType(t *types.Type, left, right *ssa.Value, skip skipMask, leftIsStmt bool) {
 	s.instrument(t, left, true)
 
-	if skip == 0 && (!types.Haspointers(t) || ssa.IsStackAddr(left)) {
+	if skip == 0 && (!t.HasPointers() || ssa.IsStackAddr(left)) {
 		// Known to not have write barrier. Store the whole type.
 		s.vars[&memVar] = s.newValue3Apos(ssa.OpStore, types.TypeMem, t, left, right, s.mem(), leftIsStmt)
 		return
@@ -4971,7 +4969,7 @@ func (s *state) storeType(t *types.Type, left, right *ssa.Value, skip skipMask, 
 	// TODO: if the writebarrier pass knows how to reorder stores,
 	// we can do a single store here as long as skip==0.
 	s.storeTypeScalars(t, left, right, skip)
-	if skip&skipPtr == 0 && types.Haspointers(t) {
+	if skip&skipPtr == 0 && t.HasPointers() {
 		s.storeTypePtrs(t, left, right)
 	}
 }
@@ -5043,7 +5041,7 @@ func (s *state) storeTypePtrs(t *types.Type, left, right *ssa.Value) {
 		n := t.NumFields()
 		for i := 0; i < n; i++ {
 			ft := t.FieldType(i)
-			if !types.Haspointers(ft) {
+			if !ft.HasPointers() {
 				continue
 			}
 			addr := s.newValue1I(ssa.OpOffPtr, ft.PtrTo(), t.FieldOff(i), left)
@@ -5807,11 +5805,6 @@ type SSAGenState struct {
 
 	// wasm: The number of values on the WebAssembly stack. This is only used as a safeguard.
 	OnWasmStackSkipped int
-
-	// Liveness index for the first function call in the final defer exit code
-	// path that we generated. All defer functions and args should be live at
-	// this point. This will be used to set the liveness for the deferreturn.
-	lastDeferLiveness LivenessIndex
 }
 
 // Prog appends a new Prog.
@@ -6056,12 +6049,6 @@ func genssa(f *ssa.Func, pp *Progs) {
 				// instruction.
 				s.pp.nextLive = s.livenessMap.Get(v)
 
-				// Remember the liveness index of the first defer call of
-				// the last defer exit
-				if v.Block.Func.LastDeferExit != nil && v == v.Block.Func.LastDeferExit {
-					s.lastDeferLiveness = s.pp.nextLive
-				}
-
 				// Special case for first line in function; move it to the start.
 				if firstPos != src.NoXPos {
 					s.SetPos(firstPos)
@@ -6122,7 +6109,7 @@ func genssa(f *ssa.Func, pp *Progs) {
 		// When doing open-coded defers, generate a disconnected call to
 		// deferreturn and a return. This will be used to during panic
 		// recovery to unwind the stack and return back to the runtime.
-		s.pp.nextLive = s.lastDeferLiveness
+		s.pp.nextLive = s.livenessMap.deferreturn
 		gencallret(pp, Deferreturn)
 	}
 
@@ -6877,6 +6864,10 @@ func (e *ssafn) Syslook(name string) *obj.LSym {
 
 func (e *ssafn) SetWBPos(pos src.XPos) {
 	e.curfn.Func.setWBPos(pos)
+}
+
+func (e *ssafn) MyImportPath() string {
+	return myimportpath
 }
 
 func (n *Node) Typ() *types.Type {

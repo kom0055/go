@@ -33,15 +33,8 @@ type Func struct {
 	Blocks []*Block    // unordered set of all basic blocks (note: not indexable by ID)
 	Entry  *Block      // the entry basic block
 
-	// If we are using open-coded defers, this is the first call to a deferred
-	// function in the final defer exit sequence that we generated. This call
-	// should be after all defer statements, and will have all args, etc. of
-	// all defer calls as live. The liveness info of this call will be used
-	// for the deferreturn/ret segment generated for functions with open-coded
-	// defers.
-	LastDeferExit *Value
-	bid           idAlloc // block ID allocator
-	vid           idAlloc // value ID allocator
+	bid idAlloc // block ID allocator
+	vid idAlloc // value ID allocator
 
 	// Given an environment variable used for debug hash match,
 	// what file (if any) receives the yes/no logging?
@@ -51,9 +44,10 @@ type Func struct {
 	PrintOrHtmlSSA bool           // true if GOSSAFUNC matches, true even if fe.Log() (spew phase results to stdout) is false.
 	ruleMatches    map[string]int // number of times countRule was called during compilation for any given string
 
-	scheduled bool // Values in Blocks are in final order
-	laidout   bool // Blocks are ordered
-	NoSplit   bool // true if function is marked as nosplit.  Used by schedule check pass.
+	scheduled   bool  // Values in Blocks are in final order
+	laidout     bool  // Blocks are ordered
+	NoSplit     bool  // true if function is marked as nosplit.  Used by schedule check pass.
+	dumpFileSeq uint8 // the sequence numbers of dump file. (%s_%02d__%s.dump", funcname, dumpFileSeq, phaseName)
 
 	// when register allocation is done, maps value ids to locations
 	RegAlloc []Location
@@ -684,7 +678,8 @@ func (f *Func) invalidateCFG() {
 //  GSHS_LOGFILE
 // or standard out if that is empty or there is an error
 // opening the file.
-func (f *Func) DebugHashMatch(evname, name string) bool {
+func (f *Func) DebugHashMatch(evname string) bool {
+	name := f.fe.MyImportPath() + "." + f.Name
 	evhash := os.Getenv(evname)
 	switch evhash {
 	case "":
@@ -733,7 +728,7 @@ func (f *Func) logDebugHashMatch(evname, name string) {
 		file = os.Stdout
 		if tmpfile := os.Getenv("GSHS_LOGFILE"); tmpfile != "" {
 			var err error
-			file, err = os.Create(tmpfile)
+			file, err = os.OpenFile(tmpfile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 			if err != nil {
 				f.Fatalf("could not open hash-testing logfile %s", tmpfile)
 			}

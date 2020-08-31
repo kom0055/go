@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // Package testing provides support for automated testing of Go packages.
-// It is intended to be used in concert with the ``go test'' command, which automates
+// It is intended to be used in concert with the "go test" command, which automates
 // execution of any function of the form
 //     func TestXxx(*testing.T)
 // where Xxx does not start with a lowercase letter. The function name
@@ -14,8 +14,8 @@
 // To write a new test suite, create a file whose name ends _test.go that
 // contains the TestXxx functions as described here. Put the file in the same
 // package as the one being tested. The file will be excluded from regular
-// package builds but will be included when the ``go test'' command is run.
-// For more detail, run ``go help test'' and ``go help testflag''.
+// package builds but will be included when the "go test" command is run.
+// For more detail, run "go help test" and "go help testflag".
 //
 // A simple test function looks like this:
 //
@@ -294,6 +294,7 @@ func Init() {
 	blockProfileRate = flag.Int("test.blockprofilerate", 1, "set blocking profile `rate` (see runtime.SetBlockProfileRate)")
 	mutexProfile = flag.String("test.mutexprofile", "", "write a mutex contention profile to the named file after execution")
 	mutexProfileFraction = flag.Int("test.mutexprofilefraction", 1, "if >= 0, calls runtime.SetMutexProfileFraction()")
+	panicOnExit0 = flag.Bool("test.paniconexit0", false, "panic on call to os.Exit(0)")
 	traceFile = flag.String("test.trace", "", "write an execution trace to `file`")
 	timeout = flag.Duration("test.timeout", 0, "panic test binary after duration `d` (default 0, timeout disabled)")
 	cpuListStr = flag.String("test.cpu", "", "comma-separated `list` of cpu counts to run each test with")
@@ -320,6 +321,7 @@ var (
 	blockProfileRate     *int
 	mutexProfile         *string
 	mutexProfileFraction *int
+	panicOnExit0         *bool
 	traceFile            *string
 	timeout              *time.Duration
 	cpuListStr           *string
@@ -357,10 +359,19 @@ func (p *testPrinter) Fprint(w io.Writer, testName, out string) {
 	defer p.lastNameMu.Unlock()
 
 	if !p.chatty ||
-		strings.HasPrefix(out, "--- PASS") ||
-		strings.HasPrefix(out, "--- FAIL") ||
-		strings.HasPrefix(out, "=== CONT") ||
-		strings.HasPrefix(out, "=== RUN") {
+		strings.HasPrefix(out, "--- PASS: ") ||
+		strings.HasPrefix(out, "--- FAIL: ") ||
+		strings.HasPrefix(out, "--- SKIP: ") ||
+		strings.HasPrefix(out, "=== RUN   ") ||
+		strings.HasPrefix(out, "=== CONT  ") ||
+		strings.HasPrefix(out, "=== PAUSE ") {
+		// If we're buffering test output (!p.chatty), we don't really care which
+		// test is emitting which line so long as they are serialized.
+		//
+		// If the message already implies an association with a specific new test,
+		// we don't need to check what the old test name was or log an extra CONT
+		// line for it. (We're updating it anyway, and the current message already
+		// includes the test name.)
 		p.lastName = testName
 		fmt.Fprint(w, out)
 		return
@@ -392,7 +403,7 @@ type common struct {
 	skipped     bool                // Test of benchmark has been skipped.
 	done        bool                // Test is finished and all subtests have completed.
 	helpers     map[string]struct{} // functions to be skipped when writing file/line info
-	cleanup     func()              // optional function to be called at the end of the test
+	cleanups    []func()            // optional functions to be called at the end of the test
 	cleanupName string              // Name of the cleanup function.
 	cleanupPc   []uintptr           // The stack trace at the point where Cleanup was called.
 
@@ -844,24 +855,31 @@ func (c *common) Helper() {
 // subtests complete. Cleanup functions will be called in last added,
 // first called order.
 func (c *common) Cleanup(f func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	oldCleanup := c.cleanup
-	oldCleanupPc := c.cleanupPc
-	c.cleanup = func() {
-		if oldCleanup != nil {
-			defer func() {
-				c.cleanupPc = oldCleanupPc
-				oldCleanup()
-			}()
-		}
-		c.cleanupName = callerName(0)
-		f()
-	}
 	var pc [maxStackLen]uintptr
 	// Skip two extra frames to account for this function and runtime.Callers itself.
 	n := runtime.Callers(2, pc[:])
-	c.cleanupPc = pc[:n]
+	cleanupPc := pc[:n]
+
+	fn := func() {
+		defer func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			c.cleanupName = ""
+			c.cleanupPc = nil
+		}()
+
+		name := callerName(0)
+		c.mu.Lock()
+		c.cleanupName = name
+		c.cleanupPc = cleanupPc
+		c.mu.Unlock()
+
+		f()
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanups = append(c.cleanups, fn)
 }
 
 var tempDirReplacer struct {
@@ -919,22 +937,37 @@ const (
 // If catchPanic is true, this will catch panics, and return the recovered
 // value if any.
 func (c *common) runCleanup(ph panicHandling) (panicVal interface{}) {
-	c.mu.Lock()
-	cleanup := c.cleanup
-	c.cleanup = nil
-	c.mu.Unlock()
-	if cleanup == nil {
-		return nil
-	}
-
 	if ph == recoverAndReturnPanic {
 		defer func() {
 			panicVal = recover()
 		}()
 	}
 
-	cleanup()
-	return nil
+	// Make sure that if a cleanup function panics,
+	// we still run the remaining cleanup functions.
+	defer func() {
+		c.mu.Lock()
+		recur := len(c.cleanups) > 0
+		c.mu.Unlock()
+		if recur {
+			c.runCleanup(normalPanic)
+		}
+	}()
+
+	for {
+		var cleanup func()
+		c.mu.Lock()
+		if len(c.cleanups) > 0 {
+			last := len(c.cleanups) - 1
+			cleanup = c.cleanups[last]
+			c.cleanups = c.cleanups[:last]
+		}
+		c.mu.Unlock()
+		if cleanup == nil {
+			return nil
+		}
+		cleanup()
+	}
 }
 
 // callerName gives the function name (qualified with a package path)
@@ -976,7 +1009,13 @@ func (t *T) Parallel() {
 		for ; root.parent != nil; root = root.parent {
 		}
 		root.mu.Lock()
-		fmt.Fprintf(root.w, "=== PAUSE %s\n", t.name)
+		// Unfortunately, even though PAUSE indicates that the named test is *no
+		// longer* running, cmd/test2json interprets it as changing the active test
+		// for the purpose of log parsing. We could fix cmd/test2json, but that
+		// won't fix existing deployments of third-party tools that already shell
+		// out to older builds of cmd/test2json — so merely fixing cmd/test2json
+		// isn't enough for now.
+		printer.Fprint(root.w, t.name, fmt.Sprintf("=== PAUSE %s\n", t.name))
 		root.mu.Unlock()
 	}
 
@@ -1242,6 +1281,7 @@ func (f matchStringOnly) WriteProfileTo(string, io.Writer, int) error { return e
 func (f matchStringOnly) ImportPath() string                          { return "" }
 func (f matchStringOnly) StartTestLog(io.Writer)                      {}
 func (f matchStringOnly) StopTestLog() error                          { return errMain }
+func (f matchStringOnly) SetPanicOnExit0(bool)                        {}
 
 // Main is an internal function, part of the implementation of the "go test" command.
 // It was exported because it is cross-package and predates "internal" packages.
@@ -1277,6 +1317,7 @@ type M struct {
 type testDeps interface {
 	ImportPath() string
 	MatchString(pat, str string) (bool, error)
+	SetPanicOnExit0(bool)
 	StartCPUProfile(io.Writer) error
 	StopCPUProfile()
 	StartTestLog(io.Writer)
@@ -1502,6 +1543,9 @@ func (m *M) before() {
 		m.deps.StartTestLog(f)
 		testlogFile = f
 	}
+	if *panicOnExit0 {
+		m.deps.SetPanicOnExit0(true)
+	}
 }
 
 // after runs after all testing.
@@ -1509,6 +1553,13 @@ func (m *M) after() {
 	m.afterOnce.Do(func() {
 		m.writeProfiles()
 	})
+
+	// Restore PanicOnExit0 after every run, because we set it to true before
+	// every run. Otherwise, if m.Run is called multiple times the behavior of
+	// os.Exit(0) will not be restored after the second run.
+	if *panicOnExit0 {
+		m.deps.SetPanicOnExit0(false)
+	}
 }
 
 func (m *M) writeProfiles() {
